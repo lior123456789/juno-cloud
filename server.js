@@ -183,6 +183,19 @@ app.post('/api/chat', auth, async (req, res) => {
 app.post('/api/task', auth, (req, res) => { req.user.tasks.unshift({ id: uid(), text: req.body.text, done: false, at: new Date().toISOString() }); save(); res.json({ tasks: req.user.tasks }); });
 app.post('/api/task/toggle', auth, (req, res) => { const t = req.user.tasks.find(t => t.id === req.body.id); if (t) t.done = !t.done; save(); res.json({ tasks: req.user.tasks }); });
 
+// ---------- integrations: catalog (server-driven, not hardcoded in the app) ----------
+const CATALOG = [
+  { key: 'gmail',  name: 'Gmail',           desc: 'Send email and let people book you by emailing Juno.', icon: '✉️', bg: 'linear-gradient(135deg,#ea4335,#ff7a6b)', kind: 'apppassword' },
+  { key: 'google', name: 'Google Calendar', desc: 'Sync events straight to your Google Calendar.',         icon: '🗓️', bg: 'linear-gradient(135deg,#1a73e8,#7eb3ff)', kind: 'google' },
+  { key: 'notion', name: 'Notion',          desc: 'Turn requests into Notion pages and tasks.',             icon: '📝', bg: 'linear-gradient(135deg,#111,#555)',     kind: 'token' },
+  { key: 'slack',  name: 'Slack',           desc: 'Post messages to your workspace by voice or chat.',      icon: '💬', bg: 'linear-gradient(135deg,#4a154b,#a25fa3)', kind: 'oauth' },
+];
+function isConfigured(key) { if (key === 'slack') return !!process.env.SLACK_CLIENT_ID; if (key === 'notion-oauth') return !!process.env.NOTION_CLIENT_ID; return true; }
+app.get('/api/integrations', auth, (req, res) => {
+  const I = req.user.integrations || {};
+  res.json({ integrations: CATALOG.map(c => ({ ...c, configured: isConfigured(c.key), connected: !!I[c.key] })) });
+});
+
 // ---------- integrations: connect ----------
 // Gmail via app password (works today, no OAuth app needed)
 app.post('/api/connect/gmail', auth, async (req, res) => {
