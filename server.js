@@ -96,6 +96,20 @@ app.post('/api/login', async (req, res) => {
   if (!u || !(await bcrypt.compare(pw, u.hash))) return res.status(401).json({ error: 'Wrong email or password.' });
   res.json({ token: sign(u), user: publicUser(u) });
 });
+// One-step: log in if the account exists, otherwise create it. (Powers the single "Continue" button.)
+app.post('/api/auth', async (req, res) => {
+  const email = lc(req.body.email), pw = req.body.password || '';
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'Enter a valid email address.' });
+  if (pw.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  let u = Object.values(DB.users).find(u => u.email === email);
+  if (u) {
+    if (!u.hash || !(await bcrypt.compare(pw, u.hash))) return res.status(401).json({ error: 'Wrong password for that account.' });
+  } else {
+    u = newUser(email, await bcrypt.hash(pw, 10)); DB.users[u.id] = u; save();
+  }
+  res.json({ token: sign(u), user: publicUser(u), created: !u.lastLogin });
+});
+
 app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), tasks: req.user.tasks, events: req.user.events, activity: req.user.activity.slice(0, 50) }));
 
 // ---------- per-user helpers ----------
