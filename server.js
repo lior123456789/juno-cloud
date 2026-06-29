@@ -147,6 +147,18 @@ const TOOLS = [
   { name: 'slack_message', description: 'Post a message to the user Slack workspace.', input_schema: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['text'] } },
   { name: 'notion_add', description: 'Add a page/task to the user Notion.', input_schema: { type: 'object', properties: { title: { type: 'string' }, content: { type: 'string' } }, required: ['title'] } },
 ];
+// Get a fresh Google access token (refreshes via the stored refresh_token so sync keeps working).
+async function getGoogleAccess(u) {
+  const g = u.integrations.google; if (!g) return null;
+  const rt = g.refresh ? dec(g.refresh) : '';
+  if (rt && process.env.GOOGLE_CLIENT_ID) {
+    try {
+      const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, refresh_token: rt, grant_type: 'refresh_token' }) });
+      const d = await r.json(); if (d.access_token) { g.access = enc(d.access_token); save(); return d.access_token; }
+    } catch {}
+  }
+  return g.access ? dec(g.access) : null;
+}
 async function gcalInsert(access, ev) {
   const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', { method: 'POST', headers: { authorization: 'Bearer ' + access, 'content-type': 'application/json' }, body: JSON.stringify({ summary: ev.title, description: ev.notes || '', start: { dateTime: new Date(ev.start).toISOString() }, end: { dateTime: new Date(ev.end).toISOString() } }) });
   const d = await r.json(); if (d.error) throw new Error(d.error.message); return d;
@@ -154,8 +166,8 @@ async function gcalInsert(access, ev) {
 async function runTool(u, name, input) {
   if (name === 'add_event') {
     const ev = { id: uid(), title: input.title, start: input.start, end: input.end || new Date(new Date(input.start).getTime() + 36e5).toISOString(), notes: input.notes || '' };
-    let synced = false; const g = u.integrations.google;
-    if (g && g.access) { try { await gcalInsert(dec(g.access), ev); synced = true; } catch {} }
+    let synced = false;
+    try { const at = await getGoogleAccess(u); if (at) { await gcalInsert(at, ev); synced = true; } } catch {}
     u.events.push(ev); logAct(u, 'calendar', `📅 Scheduled “${ev.title}”${synced ? ' (Google Calendar)' : ''}`); save();
     return `Added “${ev.title}” on ${new Date(ev.start).toLocaleString()}${synced ? ', synced to your Google Calendar.' : '.'}`;
   }
@@ -200,11 +212,11 @@ app.post('/api/task/toggle', auth, (req, res) => { const t = req.user.tasks.find
 // ---------- integrations: catalog (server-driven, not hardcoded in the app) ----------
 const CATALOG = [
   { key: 'gmail',  name: 'Gmail',           desc: 'Send email and let people book you by emailing Juno.', icon: '✉️', bg: 'linear-gradient(135deg,#ea4335,#ff7a6b)', kind: 'apppassword' },
-  { key: 'google', name: 'Google Calendar', desc: 'Sync events straight to your Google Calendar.',         icon: '🗓️', bg: 'linear-gradient(135deg,#1a73e8,#7eb3ff)', kind: 'google' },
+  { key: 'google', name: 'Google Calendar', desc: 'Sync events straight to your Google Calendar.',         icon: '🗓️', bg: 'linear-gradient(135deg,#1a73e8,#7eb3ff)', kind: 'oauth' },
   { key: 'notion', name: 'Notion',          desc: 'Turn requests into Notion pages and tasks.',             icon: '📝', bg: 'linear-gradient(135deg,#111,#555)',     kind: 'token' },
   { key: 'slack',  name: 'Slack',           desc: 'Post messages to your workspace by voice or chat.',      icon: '💬', bg: 'linear-gradient(135deg,#4a154b,#a25fa3)', kind: 'oauth' },
 ];
-function isConfigured(key) { if (key === 'slack') return !!process.env.SLACK_CLIENT_ID; if (key === 'notion-oauth') return !!process.env.NOTION_CLIENT_ID; return true; }
+function isConfigured(key) { if (key === 'slack') return !!process.env.SLACK_CLIENT_ID; if (key === 'google') return !!process.env.GOOGLE_CLIENT_ID; return true; }
 app.get('/api/integrations', auth, (req, res) => {
   const I = req.user.integrations || {};
   res.json({ integrations: CATALOG.map(c => ({ ...c, configured: isConfigured(c.key), connected: !!I[c.key] })) });
