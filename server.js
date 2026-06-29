@@ -43,10 +43,35 @@ app.use(express.json({ limit: '2mb' }));
 
 // ---------- auth ----------
 function sign(u) { return jwt.sign({ uid: u.id }, JWT_SECRET, { expiresIn: '60d' }); }
-function auth(req, res, next) {
+
+// ----- Firebase ID token verification (email/password + Google sign-in) -----
+const FB_PID = process.env.FIREBASE_PROJECT_ID || '';
+let CERTS = {}, CERTS_AT = 0;
+async function getCerts() {
+  if (Object.keys(CERTS).length && Date.now() - CERTS_AT < 3600e3) return CERTS;
+  try { CERTS = await (await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com')).json(); CERTS_AT = Date.now(); } catch {}
+  return CERTS;
+}
+async function verifyFirebase(idToken) {
+  if (!FB_PID || !idToken || idToken.split('.').length !== 3) return null;
+  const dec = jwt.decode(idToken, { complete: true });
+  if (!dec || !dec.header || !dec.header.kid) return null;
+  const cert = (await getCerts())[dec.header.kid]; if (!cert) return null;
+  try { return jwt.verify(idToken, cert, { algorithms: ['RS256'], audience: FB_PID, issuer: 'https://securetoken.google.com/' + FB_PID }); } catch { return null; }
+}
+function userFromFirebase(fb) {
+  let u = Object.values(DB.users).find(x => x.fbid === fb.user_id || (fb.email && x.email === lc(fb.email)));
+  if (!u) { u = newUser(fb.email || (fb.user_id + '@firebase'), ''); u.fbid = fb.user_id; DB.users[u.id] = u; save(); }
+  else if (!u.fbid) { u.fbid = fb.user_id; save(); }
+  return u;
+}
+async function auth(req, res, next) {
   const t = (req.headers.authorization || '').replace(/^Bearer /, '') || req.query.token;
-  try { const p = jwt.verify(t, JWT_SECRET); const u = DB.users[p.uid]; if (!u) throw 0; req.user = u; next(); }
-  catch { res.status(401).json({ error: 'unauthorized' }); }
+  try {
+    const fb = await verifyFirebase(t);
+    if (fb) { req.user = userFromFirebase(fb); return next(); }
+    const p = jwt.verify(t, JWT_SECRET); const u = DB.users[p.uid]; if (!u) throw 0; req.user = u; next();
+  } catch { res.status(401).json({ error: 'unauthorized' }); }
 }
 function publicUser(u) {
   const I = u.integrations || {};
@@ -108,8 +133,18 @@ const TOOLS = [
   { name: 'slack_message', description: 'Post a message to the user Slack workspace.', input_schema: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['text'] } },
   { name: 'notion_add', description: 'Add a page/task to the user Notion.', input_schema: { type: 'object', properties: { title: { type: 'string' }, content: { type: 'string' } }, required: ['title'] } },
 ];
+async function gcalInsert(access, ev) {
+  const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', { method: 'POST', headers: { authorization: 'Bearer ' + access, 'content-type': 'application/json' }, body: JSON.stringify({ summary: ev.title, description: ev.notes || '', start: { dateTime: new Date(ev.start).toISOString() }, end: { dateTime: new Date(ev.end).toISOString() } }) });
+  const d = await r.json(); if (d.error) throw new Error(d.error.message); return d;
+}
 async function runTool(u, name, input) {
-  if (name === 'add_event') { const ev = { id: uid(), title: input.title, start: input.start, end: input.end || new Date(new Date(input.start).getTime() + 36e5).toISOString(), notes: input.notes || '' }; u.events.push(ev); logAct(u, 'calendar', `📅 Scheduled “${ev.title}”`); save(); return `Added “${ev.title}” on ${new Date(ev.start).toLocaleString()}.`; }
+  if (name === 'add_event') {
+    const ev = { id: uid(), title: input.title, start: input.start, end: input.end || new Date(new Date(input.start).getTime() + 36e5).toISOString(), notes: input.notes || '' };
+    let synced = false; const g = u.integrations.google;
+    if (g && g.access) { try { await gcalInsert(dec(g.access), ev); synced = true; } catch {} }
+    u.events.push(ev); logAct(u, 'calendar', `📅 Scheduled “${ev.title}”${synced ? ' (Google Calendar)' : ''}`); save();
+    return `Added “${ev.title}” on ${new Date(ev.start).toLocaleString()}${synced ? ', synced to your Google Calendar.' : '.'}`;
+  }
   if (name === 'add_task') { u.tasks.unshift({ id: uid(), text: input.text, done: false, at: new Date().toISOString() }); logAct(u, 'task', `✅ Task: ${input.text}`); save(); return `Task added: ${input.text}`; }
   if (name === 'complete_task') { const q = lc(input.idOrText); const t = u.tasks.find(t => t.id === input.idOrText || lc(t.text).includes(q)); if (t) { t.done = true; save(); return 'Done: ' + t.text; } return 'No matching task.'; }
   if (name === 'list_today') { const today = new Date().toDateString(); const evs = u.events.filter(e => new Date(e.start).toDateString() === today).map(e => `${new Date(e.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — ${e.title}`); const ts = u.tasks.filter(t => !t.done).map(t => '• ' + t.text); return `Events today:\n${evs.join('\n') || 'none'}\n\nOpen tasks:\n${ts.join('\n') || 'none'}`; }
@@ -162,6 +197,11 @@ app.post('/api/connect/notion-token', auth, async (req, res) => {
   const r = await fetch('https://api.notion.com/v1/users/me', { headers: { authorization: 'Bearer ' + tok, 'Notion-Version': '2022-06-28' } }); const d = await r.json();
   if (d.object === 'error') return res.status(400).json({ error: 'Invalid Notion token.' });
   req.user.integrations.notion = { token: enc(tok) }; save(); logAct(req.user, 'notion', 'Connected Notion'); res.json({ user: publicUser(req.user) });
+});
+// Google Calendar + Gmail-send via the access token from Firebase Google sign-in
+app.post('/api/connect/google-token', auth, (req, res) => {
+  const at = (req.body.accessToken || '').trim(); if (!at) return res.status(400).json({ error: 'No Google token.' });
+  req.user.integrations.google = { access: enc(at), at: Date.now() }; save(); logAct(req.user, 'calendar', 'Connected Google Calendar'); res.json({ user: publicUser(req.user) });
 });
 app.post('/api/disconnect', auth, (req, res) => { delete req.user.integrations[req.body.which]; save(); res.json({ user: publicUser(req.user) }); });
 
