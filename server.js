@@ -119,6 +119,32 @@ function logAct(u, kind, text) { u.activity.unshift({ id: uid(), kind, text, at:
 function gmailTransport(u) { const g = u.integrations.gmail; if (!g) return null; return nodemailer.createTransport({ host: 'smtp.gmail.com', port: 465, secure: true, auth: { user: g.user, pass: dec(g.pass) } }); }
 async function sendEmail(u, { to, subject, body }) { const t = gmailTransport(u); if (!t) throw new Error('Gmail not connected.'); await t.sendMail({ from: `${u.email} (via Juno) <${u.integrations.gmail.user}>`, to, subject, text: body }); logAct(u, 'email', `Sent email to ${to}: “${subject}”`); return true; }
 
+// Zero-setup Google Calendar: email an iCalendar invite to the user's own Gmail.
+// Google auto-adds invites where the recipient is an accepted attendee — so it lands on their calendar.
+function icsFor(u, ev) {
+  const flo = (s) => String(s).replace(/[-:]/g, '').slice(0, 15);              // floating local wall-clock (no TZ shift)
+  const utc = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const email = u.integrations.gmail.user;
+  const esc = (x) => String(x || '').replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
+  return ['BEGIN:VCALENDAR', 'PRODID:-//Juno//EN', 'VERSION:2.0', 'CALSCALE:GREGORIAN', 'METHOD:REQUEST',
+    'BEGIN:VEVENT', `UID:${ev.id}@juno`, `DTSTAMP:${utc()}`, `DTSTART:${flo(ev.start)}`, `DTEND:${flo(ev.end)}`,
+    `SUMMARY:${esc(ev.title || 'Event')}`, `DESCRIPTION:${esc(ev.notes || 'Scheduled by Juno')}`,
+    `ORGANIZER;CN=${email}:mailto:${email}`,
+    `ATTENDEE;CN=${email};PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:${email}`,
+    'STATUS:CONFIRMED', 'SEQUENCE:0', 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+}
+async function sendCalInvite(u, ev) {
+  const t = gmailTransport(u); if (!t) return false;
+  const email = u.integrations.gmail.user;
+  await t.sendMail({
+    from: email, to: email,
+    subject: `Invitation: ${ev.title} @ ${new Date(ev.start).toDateString()}`,
+    text: `${ev.title}\n${ev.start}`,
+    icalEvent: { method: 'REQUEST', filename: 'invite.ics', content: icsFor(u, ev) },
+  });
+  return true;
+}
+
 // ----- Slack -----
 async function slackPost(u, { channel, text }) {
   const s = u.integrations.slack; if (!s) throw new Error('Slack not connected.');
@@ -166,10 +192,12 @@ async function gcalInsert(access, ev) {
 async function runTool(u, name, input) {
   if (name === 'add_event') {
     const ev = { id: uid(), title: input.title, start: input.start, end: input.end || new Date(new Date(input.start).getTime() + 36e5).toISOString(), notes: input.notes || '' };
-    let synced = false;
-    try { const at = await getGoogleAccess(u); if (at) { await gcalInsert(at, ev); synced = true; } } catch {}
-    u.events.push(ev); logAct(u, 'calendar', `📅 Scheduled “${ev.title}”${synced ? ' (Google Calendar)' : ''}`); save();
-    return `Added “${ev.title}” on ${new Date(ev.start).toLocaleString()}${synced ? ', synced to your Google Calendar.' : '.'}`;
+    let synced = false, how = '';
+    try { const at = await getGoogleAccess(u); if (at) { await gcalInsert(at, ev); synced = true; how = 'google'; } } catch {}
+    if (!synced && u.integrations.gmail) { try { await sendCalInvite(u, ev); synced = true; how = 'invite'; } catch {} }
+    u.events.push(ev); logAct(u, 'calendar', `📅 Scheduled “${ev.title}”${synced ? ' → Google Calendar' : ''}`); save();
+    const tail = how === 'google' ? ', synced to your Google Calendar.' : how === 'invite' ? ' — I sent it to your Google Calendar, it will show up there.' : '. (Connect Gmail or Google to sync it to your real calendar.)';
+    return `Added “${ev.title}”${tail}`;
   }
   if (name === 'add_task') { u.tasks.unshift({ id: uid(), text: input.text, done: false, at: new Date().toISOString() }); logAct(u, 'task', `✅ Task: ${input.text}`); save(); return `Task added: ${input.text}`; }
   if (name === 'complete_task') { const q = lc(input.idOrText); const t = u.tasks.find(t => t.id === input.idOrText || lc(t.text).includes(q)); if (t) { t.done = true; save(); return 'Done: ' + t.text; } return 'No matching task.'; }
