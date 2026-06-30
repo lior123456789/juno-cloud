@@ -211,6 +211,7 @@ const TOOLS = [
   { name: 'remember', description: "Save a durable fact about the user (a preference, detail, goal, or ongoing context) so you can recall it in future chats. Use whenever the user shares something worth remembering.", input_schema: { type: 'object', properties: { fact: { type: 'string' } }, required: ['fact'] } },
   { name: 'make_pdf', description: "Generate a downloadable PDF document for the user — a resume, cover letter, report, letter, invoice, study sheet, etc. Use this whenever the user asks to make/create/generate a PDF or a formatted document. Provide clean, well-structured HTML for the document body with inline CSS styling (headings, sections, spacing). Do NOT include <html>/<head>/<body> tags — just the inner content.", input_schema: { type: 'object', properties: { filename: { type: 'string', description: 'e.g. Lior_Resume.pdf' }, html: { type: 'string', description: 'the document body as styled HTML' } }, required: ['filename', 'html'] } },
   { name: 'scan_inbox', description: "Read the user's recent Gmail and plan for them — turn meeting invites into calendar events and work/action items into tasks. Use whenever the user asks to check their email, go through their inbox, or plan their day/week from email.", input_schema: { type: 'object', properties: {} } },
+  { name: 'read_url', description: "Fetch a web page, article, or blog post by its URL and read the contents so you can summarize it, extract info, or answer questions about it.", input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
 ];
 const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 5 };
 const MODES = {
@@ -221,6 +222,15 @@ const MODES = {
   programmer: '\n\nMode: act as a senior engineer. Give precise, correct, runnable code with short explanations and edge cases.',
   creative: '\n\nMode: act as a creative collaborator. Be imaginative and vivid for writing, naming, and brainstorming.',
   concise: '\n\nAnswer in as few words as possible.',
+  research: '\n\nMode: deep research. Be thorough and use web_search across multiple angles. Structure findings clearly and note sources.',
+  stepbystep: '\n\nMode: think step by step. Work through the problem methodically and show the reasoning before the final answer.',
+  quick: '\n\nMode: quick answer. Give the single best answer in one short sentence, no preamble.',
+  debate: '\n\nMode: debate. Argue both sides fairly with the strongest points for each, then give a balanced verdict.',
+  factcheck: '\n\nMode: fact-check. Use web_search to verify the claim, then rate it True / False / Unclear and cite what you found.',
+  eli5: "\n\nMode: explain like I'm 5. Use very simple words and everyday analogies.",
+  doctor: '\n\nMode: act as a knowledgeable medical information guide. Be careful and clear, and remind the user you are not a substitute for a real doctor.',
+  lawyer: '\n\nMode: act as a legal information guide. Explain clearly, and note this is general information, not legal advice.',
+  engineer: '\n\nMode: act as a senior software/systems engineer giving expert, practical guidance.',
 };
 // Get a fresh Google access token (refreshes via the stored refresh_token so sync keeps working).
 async function getGoogleAccess(u) {
@@ -259,6 +269,14 @@ async function runTool(u, name, input) {
     const out = await scanInboxNow(u, 15);
     if (!out.length) return 'I checked your inbox and there was nothing new to plan around.';
     return `I went through your recent email and planned for it:\n${out.map(o => '- ' + o).join('\n')}`;
+  }
+  if (name === 'read_url') {
+    try { let url = String(input.url || ''); if (!/^https?:\/\//.test(url)) url = 'https://' + url;
+      const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 (Macintosh) Juno/1.0' }, signal: AbortSignal.timeout(15000) });
+      let t = await r.text();
+      t = t.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ').trim();
+      return t.slice(0, 9000) || '(no readable text found on that page)';
+    } catch (e) { return 'Could not read that URL: ' + e.message; }
   }
   if (name === 'remember') { const f = (input.fact || '').trim(); if (f) { u.memories = u.memories || []; if (!u.memories.some(m => m.text.toLowerCase() === f.toLowerCase())) { u.memories.unshift({ id: uid(), text: f, at: new Date().toISOString() }); u.memories = u.memories.slice(0, 120); logAct(u, 'memory', `🧠 Remembered: ${f}`); save(); } } return 'Saved — I will remember that.'; }
   return 'Unknown tool.';
