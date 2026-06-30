@@ -224,23 +224,24 @@ const DEVICE_TOOLS = [
   { name: 'write_clipboard', description: "Put text on the user's clipboard.", input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
 ];
 const CLIENT_TOOLS = new Set(DEVICE_TOOLS.map(t => t.name));
+const MODE_PREFIX = '\n\nIMPORTANT — fully commit to this mode; it must noticeably change your tone, style and structure compared to your default voice:';
 const MODES = {
-  professional: '\n\nTone: crisp, professional, business-appropriate. No filler.',
-  friendly: '\n\nTone: warm, casual, encouraging, a little playful.',
-  coach: '\n\nMode: act as a sharp life & productivity coach. Be motivating, ask one good question when useful, give concrete next steps.',
-  teacher: '\n\nMode: act as a patient teacher. Explain step by step with simple examples and check understanding.',
-  programmer: '\n\nMode: act as a senior engineer. Give precise, correct, runnable code with short explanations and edge cases.',
-  creative: '\n\nMode: act as a creative collaborator. Be imaginative and vivid for writing, naming, and brainstorming.',
-  concise: '\n\nAnswer in as few words as possible.',
-  research: '\n\nMode: deep research. Be thorough and use web_search across multiple angles. Structure findings clearly and note sources.',
-  stepbystep: '\n\nMode: think step by step. Work through the problem methodically and show the reasoning before the final answer.',
-  quick: '\n\nMode: quick answer. Give the single best answer in one short sentence, no preamble.',
-  debate: '\n\nMode: debate. Argue both sides fairly with the strongest points for each, then give a balanced verdict.',
-  factcheck: '\n\nMode: fact-check. Use web_search to verify the claim, then rate it True / False / Unclear and cite what you found.',
-  eli5: "\n\nMode: explain like I'm 5. Use very simple words and everyday analogies.",
-  doctor: '\n\nMode: act as a knowledgeable medical information guide. Be careful and clear, and remind the user you are not a substitute for a real doctor.',
-  lawyer: '\n\nMode: act as a legal information guide. Explain clearly, and note this is general information, not legal advice.',
-  engineer: '\n\nMode: act as a senior software/systems engineer giving expert, practical guidance.',
+  professional: MODE_PREFIX + ' Professional mode. Crisp, direct, businesslike. Plain factual language — NO poetic or flowery wording, no metaphors, no filler. Lead with the point. Sound like a polished business memo.',
+  friendly: MODE_PREFIX + ' Friendly mode. Warm, casual, upbeat, a little playful. Use everyday language and the occasional emoji. Sound like a supportive friend.',
+  coach: MODE_PREFIX + ' Coach mode. Motivating and energetic. Push the user, ask one sharp question when useful, and give concrete next steps and accountability.',
+  teacher: MODE_PREFIX + ' Teacher mode. Patient and structured. Explain step by step with simple examples and analogies, and check understanding.',
+  programmer: MODE_PREFIX + ' Programmer mode. Act as a senior engineer. Give precise, correct, runnable code with brief explanations, edge cases, and best practices.',
+  creative: MODE_PREFIX + ' Creative mode. Be a bold, expressive writer — vivid imagery, metaphor, rhythm and flair. This is art, not a report. Take imaginative risks.',
+  concise: MODE_PREFIX + ' Concise mode. Answer in as few words as possible — ideally one short sentence, no preamble.',
+  research: MODE_PREFIX + ' Deep research mode. Be thorough; use web_search across multiple angles. Structure findings with clear sections and note sources.',
+  stepbystep: MODE_PREFIX + ' Step-by-step mode. Work through the problem methodically, numbering each step and showing the reasoning before the final answer.',
+  quick: MODE_PREFIX + ' Quick mode. Give only the single best answer in one short sentence, no preamble, no explanation.',
+  debate: MODE_PREFIX + ' Debate mode. Argue both sides with the strongest points for each (label them), then give a balanced verdict.',
+  factcheck: MODE_PREFIX + ' Fact-check mode. Use web_search to verify, then rate True / False / Unclear and cite what you found.',
+  eli5: MODE_PREFIX + " Explain-like-I'm-5 mode. Use very simple words and fun everyday analogies a child would get.",
+  doctor: MODE_PREFIX + ' Doctor mode. Act as a knowledgeable medical information guide — clear and careful — and remind them you are not a substitute for a real doctor.',
+  lawyer: MODE_PREFIX + ' Lawyer mode. Act as a legal information guide — explain clearly in plain terms — and note this is general information, not legal advice.',
+  engineer: MODE_PREFIX + ' Engineer mode. Act as a senior software/systems engineer giving expert, precise, practical guidance.',
 };
 // Get a fresh Google access token (refreshes via the stored refresh_token so sync keeps working).
 async function getGoogleAccess(u) {
