@@ -236,6 +236,7 @@ app.post('/api/chat', auth, async (req, res) => {
 // ---------- task/event quick endpoints ----------
 app.post('/api/task', auth, (req, res) => { req.user.tasks.unshift({ id: uid(), text: req.body.text, done: false, at: new Date().toISOString() }); save(); res.json({ tasks: req.user.tasks }); });
 app.post('/api/task/toggle', auth, (req, res) => { const t = req.user.tasks.find(t => t.id === req.body.id); if (t) t.done = !t.done; save(); res.json({ tasks: req.user.tasks }); });
+app.post('/api/event/delete', auth, (req, res) => { const before = req.user.events.length; req.user.events = req.user.events.filter(e => e.id !== req.body.id); if (req.user.events.length < before) logAct(req.user, 'calendar', '🗑️ Removed an event'); save(); res.json({ events: req.user.events }); });
 
 // ---------- integrations: catalog (server-driven, not hardcoded in the app) ----------
 const CATALOG = [
