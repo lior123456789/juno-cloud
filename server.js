@@ -33,13 +33,13 @@ const lc = (s) => String(s || '').trim().toLowerCase();
 
 function newUser(email, hash) {
   return { id: uid(), email: lc(email), hash, createdAt: Date.now(),
-    tasks: [], events: [], messages: [], activity: [], seenMail: [],
+    tasks: [], events: [], messages: [], activity: [], seenMail: [], memories: [],
     integrations: {} /* gmail:{user,pass(enc)}, slack:{token(enc),team}, notion:{token(enc)}, google:{refresh(enc)} */ };
 }
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '14mb' })); // room for uploaded PDFs/images
 
 // ---------- auth ----------
 function sign(u) { return jwt.sign({ uid: u.id }, JWT_SECRET, { expiresIn: '60d' }); }
@@ -110,7 +110,9 @@ app.post('/api/auth', async (req, res) => {
   res.json({ token: sign(u), user: publicUser(u), created: !u.lastLogin });
 });
 
-app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), tasks: req.user.tasks, events: req.user.events, activity: req.user.activity.slice(0, 50) }));
+app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), tasks: req.user.tasks, events: req.user.events, activity: req.user.activity.slice(0, 50), memories: req.user.memories || [] }));
+app.post('/api/memory/delete', auth, (req, res) => { req.user.memories = (req.user.memories || []).filter(m => m.id !== req.body.id); save(); res.json({ memories: req.user.memories }); });
+app.post('/api/memory/add', auth, (req, res) => { const f = (req.body.fact || '').trim(); if (f) { req.user.memories = req.user.memories || []; req.user.memories.unshift({ id: uid(), text: f, at: new Date().toISOString() }); save(); } res.json({ memories: req.user.memories }); });
 
 // ---------- per-user helpers ----------
 function logAct(u, kind, text) { u.activity.unshift({ id: uid(), kind, text, at: new Date().toISOString() }); u.activity = u.activity.slice(0, 80); save(); }
@@ -172,7 +174,18 @@ const TOOLS = [
   { name: 'send_email', description: "Send an email from the user's connected Gmail.", input_schema: { type: 'object', properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'subject', 'body'] } },
   { name: 'slack_message', description: 'Post a message to the user Slack workspace.', input_schema: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['text'] } },
   { name: 'notion_add', description: 'Add a page/task to the user Notion.', input_schema: { type: 'object', properties: { title: { type: 'string' }, content: { type: 'string' } }, required: ['title'] } },
+  { name: 'remember', description: "Save a durable fact about the user (a preference, detail, goal, or ongoing context) so you can recall it in future chats. Use whenever the user shares something worth remembering.", input_schema: { type: 'object', properties: { fact: { type: 'string' } }, required: ['fact'] } },
 ];
+const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 5 };
+const MODES = {
+  professional: '\n\nTone: crisp, professional, business-appropriate. No filler.',
+  friendly: '\n\nTone: warm, casual, encouraging, a little playful.',
+  coach: '\n\nMode: act as a sharp life & productivity coach. Be motivating, ask one good question when useful, give concrete next steps.',
+  teacher: '\n\nMode: act as a patient teacher. Explain step by step with simple examples and check understanding.',
+  programmer: '\n\nMode: act as a senior engineer. Give precise, correct, runnable code with short explanations and edge cases.',
+  creative: '\n\nMode: act as a creative collaborator. Be imaginative and vivid for writing, naming, and brainstorming.',
+  concise: '\n\nAnswer in as few words as possible.',
+};
 // Get a fresh Google access token (refreshes via the stored refresh_token so sync keeps working).
 async function getGoogleAccess(u) {
   const g = u.integrations.google; if (!g) return null;
@@ -205,20 +218,38 @@ async function runTool(u, name, input) {
   if (name === 'send_email') return (await sendEmail(u, input), `Email sent to ${input.to}.`);
   if (name === 'slack_message') return (await slackPost(u, input), 'Posted to Slack.');
   if (name === 'notion_add') return (await notionAdd(u, input), `Added to Notion: ${input.title}.`);
+  if (name === 'remember') { const f = (input.fact || '').trim(); if (f) { u.memories = u.memories || []; if (!u.memories.some(m => m.text.toLowerCase() === f.toLowerCase())) { u.memories.unshift({ id: uid(), text: f, at: new Date().toISOString() }); u.memories = u.memories.slice(0, 120); logAct(u, 'memory', `🧠 Remembered: ${f}`); save(); } } return 'Saved — I will remember that.'; }
   return 'Unknown tool.';
 }
 async function claude(body) { const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify(body) }); const d = await r.json(); if (d.error) throw new Error(d.error.message); return d; }
-const SYSTEM = (u) => { const c = publicUser(u).connections; return `You are Juno, ${u.email}'s warm, sharp personal assistant. Manage their calendar, tasks, email, Slack and Notion. Be concise — talk like a great chief of staff. When asked to do something, USE TOOLS to actually do it, then confirm in one line. ACT FIRST — never interrogate. For scheduling and tasks, make sensible assumptions (a reasonable title like "Lunch", a 1-hour default duration, a sensible time of day) and call the tool IMMEDIATELY. Do NOT ask follow-up questions like "what's the title?" or "how long?" for routine requests — just do it and confirm; the user can correct you after. Only ask a question if the request is genuinely impossible to act on. If a tool needs an integration that isn't connected, tell them to connect it on the Integrations page. Connected now: ${Object.entries(c).filter(([k, v]) => v && k !== 'brain').map(([k]) => k).join(', ') || 'calendar + tasks only'}. Current date/time: ${new Date().toString()}.\n\nWrite in plain, natural sentences. Never use markdown formatting — no asterisks, no dashes or bullet points, no headers. Replies are spoken aloud, so keep them short and conversational.`; };
+const SYSTEM = (u, mode) => { const c = publicUser(u).connections;
+  const mems = (u.memories || []).slice(0, 50).map(m => '- ' + m.text).join('\n');
+  const memBlock = mems ? `\n\nWhat you know about ${u.email} (use naturally when relevant, do not recite as a list):\n${mems}` : '';
+  const modeBlock = MODES[mode] || '';
+  return `You are Juno, ${u.email}'s warm, sharp personal assistant and a capable general AI. Besides managing their calendar, tasks, email, Slack and Notion, you also: search the web for current info, summarize and analyze uploaded files and images, write and rewrite text, translate, do math, write and debug code, brainstorm, and teach. Use web_search for anything time-sensitive or that you are unsure about. Be concise — talk like a great chief of staff. When asked to do something, USE TOOLS to actually do it, then confirm in one line. ACT FIRST — never interrogate. For scheduling and tasks, make sensible assumptions (a reasonable title like "Lunch", a 1-hour default duration, a sensible time of day) and call the tool IMMEDIATELY. Do NOT ask follow-up questions like "what's the title?" or "how long?" for routine requests — just do it and confirm; the user can correct you after. Only ask a question if the request is genuinely impossible to act on. If a tool needs an integration that isn't connected, tell them to connect it on the Integrations page. Connected now: ${Object.entries(c).filter(([k, v]) => v && k !== 'brain').map(([k]) => k).join(', ') || 'calendar + tasks only'}. Current date/time: ${new Date().toString()}.\n\nWrite in plain, natural sentences. Avoid heavy markdown — no decorative asterisks or bullet characters. Keep replies conversational.${modeBlock}${memBlock}`; };
 
 app.post('/api/chat', auth, async (req, res) => {
   if (!CLAUDE_KEY) return res.status(500).json({ error: 'Brain not configured.' });
   const u = req.user;
+  const mode = req.body.mode || '';
   const messages = (req.body.history || []).slice(-20).map(m => ({ role: m.role, content: m.content }));
+  // attach an uploaded file/image to the latest user message (PDF + image analysis)
+  const a = req.body.attachment;
+  if (a && a.data && messages.length) {
+    const last = messages[messages.length - 1];
+    const promptText = typeof last.content === 'string' ? last.content : 'Please analyze the attached file.';
+    const blocks = [];
+    if (a.kind === 'pdf') blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: a.data } });
+    else blocks.push({ type: 'image', source: { type: 'base64', media_type: a.mediaType || 'image/jpeg', data: a.data } });
+    blocks.push({ type: 'text', text: promptText });
+    last.content = blocks;
+  }
+  const tools = [...TOOLS, WEB_SEARCH];
   try {
     let guard = 0;
-    while (guard++ < 6) {
-      const d = await claude({ model: MODEL, max_tokens: 1600, system: SYSTEM(u), tools: TOOLS, messages });
-      const toolUses = (d.content || []).filter(c => c.type === 'tool_use');
+    while (guard++ < 8) {
+      const d = await claude({ model: MODEL, max_tokens: 2600, system: SYSTEM(u, mode), tools, messages });
+      const toolUses = (d.content || []).filter(c => c.type === 'tool_use'); // client-side tools
       if (toolUses.length) {
         messages.push({ role: 'assistant', content: d.content });
         const results = [];
@@ -226,8 +257,9 @@ app.post('/api/chat', auth, async (req, res) => {
         messages.push({ role: 'user', content: results });
         continue;
       }
+      if (d.stop_reason === 'pause_turn') { messages.push({ role: 'assistant', content: d.content }); continue; } // web search continuation
       const text = (d.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-      return res.json({ text: text || 'Done.', user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50) });
+      return res.json({ text: text || 'Done.', user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] });
     }
     res.json({ text: 'Done.', tasks: u.tasks, events: u.events });
   } catch (e) { res.status(500).json({ error: e.message }); }
