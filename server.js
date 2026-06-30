@@ -33,7 +33,7 @@ const lc = (s) => String(s || '').trim().toLowerCase();
 
 function newUser(email, hash) {
   return { id: uid(), email: lc(email), hash, createdAt: Date.now(),
-    tasks: [], events: [], messages: [], activity: [], seenMail: [], memories: [],
+    tasks: [], events: [], messages: [], activity: [], seenMail: [], memories: [], agents: [],
     integrations: {} /* gmail:{user,pass(enc)}, slack:{token(enc),team}, notion:{token(enc)}, google:{refresh(enc)} */ };
 }
 
@@ -165,6 +165,40 @@ async function notionAdd(u, { title, content }) {
   const d = await r.json(); if (d.object === 'error') throw new Error('Notion: ' + d.message); logAct(u, 'notion', `Added Notion page: “${title}”`); return true;
 }
 
+// On-demand: read recent Gmail, turn meeting invites into events and work items into tasks (deduped).
+async function scanInboxNow(u, limit = 15) {
+  const g = u.integrations.gmail; if (!ImapFlow || !g) return [];
+  const client = new ImapFlow({ host: 'imap.gmail.com', port: 993, secure: true, auth: { user: g.user, pass: dec(g.pass) }, logger: false });
+  const out = [];
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const all = [];
+      for await (const msg of client.fetch({ since: new Date(Date.now() - 6 * 864e5) }, { envelope: true, source: true })) all.push(msg);
+      for (const msg of all.slice(-limit)) {
+        const from = (msg.envelope.from && msg.envelope.from[0] && msg.envelope.from[0].address) || 'someone';
+        const subject = msg.envelope.subject || '(no subject)';
+        const text = msg.source.toString().slice(0, 5000);
+        const sys = `You are Juno's inbox planner for ${u.email}. Classify this email and plan for it. Reply ONLY JSON: {"type":"meeting"|"task"|"fyi","event":{"title":"","start":"ISO datetime","end":"ISO datetime","notes":""}|null,"task":"short action text"|null,"summary":"one short line describing what you did, or why it is just FYI"}. Treat calendar invites, calls, and scheduled work as meetings (make an event). Treat requests, deadlines, and to-dos as tasks. Today is ${new Date().toString()}.`;
+        let plan = {};
+        try { const d = await claude({ model: MODEL, max_tokens: 500, system: sys, messages: [{ role: 'user', content: `From: ${from}\nSubject: ${subject}\n\n${text}` }] }); plan = JSON.parse(((d.content[0] || {}).text || '{}').replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()); } catch { continue; }
+        if (plan.event && plan.event.title) {
+          const dup = u.events.some(e => e.title === plan.event.title && new Date(e.start).getTime() === new Date(plan.event.start).getTime());
+          if (!dup) { u.events.push({ id: uid(), title: plan.event.title, start: plan.event.start, end: plan.event.end || new Date(new Date(plan.event.start).getTime() + 36e5).toISOString(), notes: plan.event.notes || '', source: `email from ${from}` }); logAct(u, 'calendar', `📅 Planned “${plan.event.title}” from ${from}`); }
+        }
+        if (plan.task) {
+          const dup = u.tasks.some(t => t.text.toLowerCase() === String(plan.task).toLowerCase());
+          if (!dup) { u.tasks.unshift({ id: uid(), text: plan.task, done: false, source: `email from ${from}`, at: new Date().toISOString() }); logAct(u, 'task', `✅ ${plan.task} (from ${from})`); }
+        }
+        if (plan.summary) out.push(plan.summary);
+      }
+      save();
+    } finally { lock.release(); }
+  } catch (e) { /* return whatever we got */ } finally { try { await client.logout(); } catch {} }
+  return out;
+}
+
 // ---------- Claude tool-loop (uses YOUR key, acts as the logged-in user) ----------
 const TOOLS = [
   { name: 'add_event', description: "Add an event to the user's calendar.", input_schema: { type: 'object', properties: { title: { type: 'string' }, start: { type: 'string', description: 'ISO datetime' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['title', 'start'] } },
@@ -176,6 +210,7 @@ const TOOLS = [
   { name: 'notion_add', description: 'Add a page/task to the user Notion.', input_schema: { type: 'object', properties: { title: { type: 'string' }, content: { type: 'string' } }, required: ['title'] } },
   { name: 'remember', description: "Save a durable fact about the user (a preference, detail, goal, or ongoing context) so you can recall it in future chats. Use whenever the user shares something worth remembering.", input_schema: { type: 'object', properties: { fact: { type: 'string' } }, required: ['fact'] } },
   { name: 'make_pdf', description: "Generate a downloadable PDF document for the user — a resume, cover letter, report, letter, invoice, study sheet, etc. Use this whenever the user asks to make/create/generate a PDF or a formatted document. Provide clean, well-structured HTML for the document body with inline CSS styling (headings, sections, spacing). Do NOT include <html>/<head>/<body> tags — just the inner content.", input_schema: { type: 'object', properties: { filename: { type: 'string', description: 'e.g. Lior_Resume.pdf' }, html: { type: 'string', description: 'the document body as styled HTML' } }, required: ['filename', 'html'] } },
+  { name: 'scan_inbox', description: "Read the user's recent Gmail and plan for them — turn meeting invites into calendar events and work/action items into tasks. Use whenever the user asks to check their email, go through their inbox, or plan their day/week from email.", input_schema: { type: 'object', properties: {} } },
 ];
 const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 5 };
 const MODES = {
@@ -219,6 +254,12 @@ async function runTool(u, name, input) {
   if (name === 'send_email') return (await sendEmail(u, input), `Email sent to ${input.to}.`);
   if (name === 'slack_message') return (await slackPost(u, input), 'Posted to Slack.');
   if (name === 'notion_add') return (await notionAdd(u, input), `Added to Notion: ${input.title}.`);
+  if (name === 'scan_inbox') {
+    if (!u.integrations.gmail) return 'Gmail is not connected yet — connect it on the Integrations page and I will read your inbox and plan from it.';
+    const out = await scanInboxNow(u, 15);
+    if (!out.length) return 'I checked your inbox and there was nothing new to plan around.';
+    return `I went through your recent email and planned for it:\n${out.map(o => '- ' + o).join('\n')}`;
+  }
   if (name === 'remember') { const f = (input.fact || '').trim(); if (f) { u.memories = u.memories || []; if (!u.memories.some(m => m.text.toLowerCase() === f.toLowerCase())) { u.memories.unshift({ id: uid(), text: f, at: new Date().toISOString() }); u.memories = u.memories.slice(0, 120); logAct(u, 'memory', `🧠 Remembered: ${f}`); save(); } } return 'Saved — I will remember that.'; }
   return 'Unknown tool.';
 }
@@ -228,6 +269,61 @@ const SYSTEM = (u, mode) => { const c = publicUser(u).connections;
   const memBlock = mems ? `\n\nWhat you know about ${u.email} (use naturally when relevant, do not recite as a list):\n${mems}` : '';
   const modeBlock = MODES[mode] || '';
   return `You are Juno, ${u.email}'s warm, sharp personal assistant and a capable general AI. Besides managing their calendar, tasks, email, Slack and Notion, you also: search the web for current info, summarize and analyze uploaded files and images, write and rewrite text, translate, do math, write and debug code, brainstorm, and teach. Use web_search for anything time-sensitive or that you are unsure about. Be concise — talk like a great chief of staff. When asked to do something, USE TOOLS to actually do it, then confirm in one line. ACT FIRST — never interrogate. For scheduling and tasks, make sensible assumptions (a reasonable title like "Lunch", a 1-hour default duration, a sensible time of day) and call the tool IMMEDIATELY. Do NOT ask follow-up questions like "what's the title?" or "how long?" for routine requests — just do it and confirm; the user can correct you after. Only ask a question if the request is genuinely impossible to act on. If a tool needs an integration that isn't connected, tell them to connect it on the Integrations page. Connected now: ${Object.entries(c).filter(([k, v]) => v && k !== 'brain').map(([k]) => k).join(', ') || 'calendar + tasks only'}. Current date/time: ${new Date().toString()}.\n\nWrite in plain, natural sentences. Avoid heavy markdown — no decorative asterisks or bullet characters. Keep replies conversational.${modeBlock}${memBlock}`; };
+
+// Reusable agentic loop — runs Claude with all tools until it produces a final answer. Used by chat AND by autonomous agents.
+async function runJuno(u, messages, mode) {
+  const tools = [...TOOLS, WEB_SEARCH];
+  let pendingDoc = null, guard = 0;
+  while (guard++ < 8) {
+    const d = await claude({ model: MODEL, max_tokens: 4000, system: SYSTEM(u, mode), tools, messages });
+    const toolUses = (d.content || []).filter(c => c.type === 'tool_use');
+    if (toolUses.length) {
+      messages.push({ role: 'assistant', content: d.content });
+      const results = [];
+      for (const tu of toolUses) {
+        if (tu.name === 'make_pdf') { pendingDoc = { filename: (tu.input.filename || 'document.pdf'), html: tu.input.html || '' }; results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'PDF generated and shown to the user with a Download button.' }); continue; }
+        let out; try { out = await runTool(u, tu.name, tu.input || {}); } catch (e) { out = 'Error: ' + e.message; }
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: out });
+      }
+      messages.push({ role: 'user', content: results });
+      continue;
+    }
+    if (d.stop_reason === 'pause_turn') { messages.push({ role: 'assistant', content: d.content }); continue; }
+    const text = (d.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
+    return { text: text || 'Done.', document: pendingDoc };
+  }
+  return { text: 'Done.', document: pendingDoc };
+}
+
+// ---------- autonomous agents (run on a schedule, 24/7, server-side) ----------
+const AGENT_FREQ = { q15: 15 * 60e3, hourly: 60 * 60e3, q6h: 6 * 3600e3, daily: 24 * 3600e3 };
+const FREQ_LABEL = { q15: 'every 15 min', hourly: 'every hour', q6h: 'every 6 hours', daily: 'once a day' };
+async function runAgent(u, agent) {
+  agent.lastRun = Date.now();
+  const messages = [{ role: 'user', content: `${agent.instruction}\n\n(You are "${agent.name}", an autonomous agent running on a schedule for ${u.email}. Take real action now using your tools — schedule events, add tasks, scan email, search the web, send messages as appropriate. Then reply with one concise line summarizing what you did this run.)` }];
+  try { const { text } = await runJuno(u, messages, 'concise'); agent.lastResult = text; agent.lastResultAt = new Date().toISOString(); logAct(u, 'agent', `🤖 ${agent.name}: ${text.slice(0, 100)}`); }
+  catch (e) { agent.lastResult = 'Error: ' + e.message; }
+  save();
+}
+function agentDue(a) {
+  if (!a.enabled) return false;
+  const last = a.lastRun || 0;
+  if (a.freq === 'daily') { const targetH = (a.hour != null ? a.hour : 8); if (new Date().getHours() !== targetH) return false; return (Date.now() - last) > 20 * 3600e3; }
+  return (Date.now() - last) >= (AGENT_FREQ[a.freq] || 3600e3);
+}
+let agentsRunning = false;
+async function tickAgents() {
+  if (agentsRunning || !CLAUDE_KEY) return; agentsRunning = true;
+  for (const u of Object.values(DB.users)) { for (const a of (u.agents || [])) { try { if (agentDue(a)) await runAgent(u, a); } catch {} } }
+  agentsRunning = false;
+}
+setInterval(tickAgents, 60000); setTimeout(tickAgents, 15000);
+
+app.get('/api/agents', auth, (req, res) => res.json({ agents: req.user.agents || [], freqLabels: FREQ_LABEL }));
+app.post('/api/agents/create', auth, (req, res) => { const { name, instruction, freq, hour } = req.body || {}; if (!instruction) return res.status(400).json({ error: 'Tell the agent what to do.' }); req.user.agents = req.user.agents || []; req.user.agents.unshift({ id: uid(), name: name || 'Agent', instruction, freq: AGENT_FREQ[freq] ? freq : 'daily', hour: (hour != null ? Number(hour) : 8), enabled: true, lastRun: 0, lastResult: '', createdAt: Date.now() }); save(); res.json({ agents: req.user.agents }); });
+app.post('/api/agents/toggle', auth, (req, res) => { const a = (req.user.agents || []).find(a => a.id === req.body.id); if (a) a.enabled = !a.enabled; save(); res.json({ agents: req.user.agents }); });
+app.post('/api/agents/delete', auth, (req, res) => { req.user.agents = (req.user.agents || []).filter(a => a.id !== req.body.id); save(); res.json({ agents: req.user.agents }); });
+app.post('/api/agents/run', auth, async (req, res) => { const a = (req.user.agents || []).find(a => a.id === req.body.id); if (!a) return res.status(404).json({ error: 'not found' }); await runAgent(req.user, a); res.json({ agents: req.user.agents, events: req.user.events, tasks: req.user.tasks, activity: req.user.activity.slice(0, 50) }); });
 
 app.post('/api/chat', auth, async (req, res) => {
   if (!CLAUDE_KEY) return res.status(500).json({ error: 'Brain not configured.' });
@@ -245,29 +341,9 @@ app.post('/api/chat', auth, async (req, res) => {
     blocks.push({ type: 'text', text: promptText });
     last.content = blocks;
   }
-  const tools = [...TOOLS, WEB_SEARCH];
-  let pendingDoc = null;
   try {
-    let guard = 0;
-    while (guard++ < 8) {
-      const d = await claude({ model: MODEL, max_tokens: 4000, system: SYSTEM(u, mode), tools, messages });
-      const toolUses = (d.content || []).filter(c => c.type === 'tool_use'); // client-side tools
-      if (toolUses.length) {
-        messages.push({ role: 'assistant', content: d.content });
-        const results = [];
-        for (const tu of toolUses) {
-          if (tu.name === 'make_pdf') { pendingDoc = { filename: (tu.input.filename || 'document.pdf'), html: tu.input.html || '' }; results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'PDF generated and shown to the user with a Download button.' }); continue; }
-          let out; try { out = await runTool(u, tu.name, tu.input || {}); } catch (e) { out = 'Error: ' + e.message; }
-          results.push({ type: 'tool_result', tool_use_id: tu.id, content: out });
-        }
-        messages.push({ role: 'user', content: results });
-        continue;
-      }
-      if (d.stop_reason === 'pause_turn') { messages.push({ role: 'assistant', content: d.content }); continue; } // web search continuation
-      const text = (d.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-      return res.json({ text: text || 'Done.', document: pendingDoc, user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] });
-    }
-    res.json({ text: 'Done.', tasks: u.tasks, events: u.events });
+    const { text, document } = await runJuno(u, messages, mode);
+    res.json({ text, document, user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
