@@ -490,5 +490,9 @@ let polling = false;
 async function pollAll() { if (polling) return; polling = true; for (const u of Object.values(DB.users)) { try { await pollUser(u); } catch {} } polling = false; }
 setInterval(pollAll, 90000); setTimeout(pollAll, 8000);
 
+// never let a stray error take the whole server down (keeps the API up = no "failed to fetch")
+process.on('uncaughtException', (e) => console.error('uncaughtException:', e && e.message));
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && (e.message || e)));
+
 const PORT = process.env.PORT || 4500;
 app.listen(PORT, () => console.log(`🌙 Juno Cloud on :${PORT} — brain:${!!CLAUDE_KEY} users:${Object.keys(DB.users).length}`));
