@@ -214,6 +214,16 @@ const TOOLS = [
   { name: 'read_url', description: "Fetch a web page, article, or blog post by its URL and read the contents so you can summarize it, extract info, or answer questions about it.", input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
 ];
 const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 5 };
+// Device tools execute on the user's Mac (in the desktop app), not on the server.
+const DEVICE_TOOLS = [
+  { name: 'open_app', description: "Open/launch a Mac application by name (Safari, Spotify, Notes, Music, Mail, etc.).", input_schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
+  { name: 'run_applescript', description: "Run AppleScript on the user's Mac to control apps and the system — play/pause music, set volume, create Notes/Reminders, open URLs in Safari, toggle dark mode, etc. Give a complete, correct script.", input_schema: { type: 'object', properties: { script: { type: 'string' } }, required: ['script'] } },
+  { name: 'run_shell', description: "Run a zsh shell command on the user's Mac — manage files/folders, clean the Downloads folder, git, etc. Avoid destructive commands unless the user clearly asked.", input_schema: { type: 'object', properties: { cmd: { type: 'string' } }, required: ['cmd'] } },
+  { name: 'take_screenshot', description: "Capture the user's screen so you can SEE what's on it and answer questions about it.", input_schema: { type: 'object', properties: {} } },
+  { name: 'read_clipboard', description: "Read the text currently on the user's clipboard.", input_schema: { type: 'object', properties: {} } },
+  { name: 'write_clipboard', description: "Put text on the user's clipboard.", input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+];
+const CLIENT_TOOLS = new Set(DEVICE_TOOLS.map(t => t.name));
 const MODES = {
   professional: '\n\nTone: crisp, professional, business-appropriate. No filler.',
   friendly: '\n\nTone: warm, casual, encouraging, a little playful.',
@@ -282,27 +292,30 @@ async function runTool(u, name, input) {
   return 'Unknown tool.';
 }
 async function claude(body) { const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': CLAUDE_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify(body) }); const d = await r.json(); if (d.error) throw new Error(d.error.message); return d; }
-const SYSTEM = (u, mode) => { const c = publicUser(u).connections;
+const SYSTEM = (u, mode, device) => { const c = publicUser(u).connections;
   const mems = (u.memories || []).slice(0, 50).map(m => '- ' + m.text).join('\n');
   const memBlock = mems ? `\n\nWhat you know about ${u.email} (use naturally when relevant, do not recite as a list):\n${mems}` : '';
   const modeBlock = MODES[mode] || '';
-  return `You are Juno, ${u.email}'s warm, sharp personal assistant and a capable general AI. Besides managing their calendar, tasks, email, Slack and Notion, you also: search the web for current info, read any specific web page or link the user gives you (ALWAYS use the read_url tool when the user pastes or names a URL — never say you cannot browse), generate downloadable PDF documents (make_pdf), summarize and analyze uploaded files and images, write and rewrite text, translate, do math, write and debug code, brainstorm, and teach. Use web_search for anything time-sensitive or that you are unsure about. Be concise — talk like a great chief of staff. When asked to do something, USE TOOLS to actually do it, then confirm in one line. ACT FIRST — never interrogate. For scheduling and tasks, make sensible assumptions (a reasonable title like "Lunch", a 1-hour default duration, a sensible time of day) and call the tool IMMEDIATELY. Do NOT ask follow-up questions like "what's the title?" or "how long?" for routine requests — just do it and confirm; the user can correct you after. Only ask a question if the request is genuinely impossible to act on. If a tool needs an integration that isn't connected, tell them to connect it on the Integrations page. Connected now: ${Object.entries(c).filter(([k, v]) => v && k !== 'brain').map(([k]) => k).join(', ') || 'calendar + tasks only'}. Current date/time: ${new Date().toString()}.\n\nWrite in plain, natural sentences. Avoid heavy markdown — no decorative asterisks or bullet characters. Keep replies conversational.${modeBlock}${memBlock}`; };
+  const deviceBlock = device ? "\n\nYou are running in the desktop app and CAN control this Mac: open_app, run_applescript (control Music/Notes/Reminders/Safari/volume/dark mode/etc.), run_shell (files, Downloads cleanup, git), take_screenshot (to SEE the screen), read_clipboard, write_clipboard. When the user asks you to do something on their computer or about what's on their screen, USE these tools." : '';
+  return `You are Juno, ${u.email}'s warm, sharp personal assistant and a capable general AI. Besides managing their calendar, tasks, email, Slack and Notion, you also: search the web for current info, read any specific web page or link the user gives you (ALWAYS use the read_url tool when the user pastes or names a URL — never say you cannot browse), generate downloadable PDF documents (make_pdf), summarize and analyze uploaded files and images, write and rewrite text, translate, do math, write and debug code, brainstorm, and teach. Use web_search for anything time-sensitive or that you are unsure about. Be concise — talk like a great chief of staff. When asked to do something, USE TOOLS to actually do it, then confirm in one line. ACT FIRST — never interrogate. For scheduling and tasks, make sensible assumptions (a reasonable title like "Lunch", a 1-hour default duration, a sensible time of day) and call the tool IMMEDIATELY. Do NOT ask follow-up questions like "what's the title?" or "how long?" for routine requests — just do it and confirm; the user can correct you after. Only ask a question if the request is genuinely impossible to act on. If a tool needs an integration that isn't connected, tell them to connect it on the Integrations page. Connected now: ${Object.entries(c).filter(([k, v]) => v && k !== 'brain').map(([k]) => k).join(', ') || 'calendar + tasks only'}. Current date/time: ${new Date().toString()}.\n\nWrite in plain, natural sentences. Avoid heavy markdown — no decorative asterisks or bullet characters. Keep replies conversational.${deviceBlock}${modeBlock}${memBlock}`; };
 
 // Reusable agentic loop — runs Claude with all tools until it produces a final answer. Used by chat AND by autonomous agents.
-async function runJuno(u, messages, mode) {
-  const tools = [...TOOLS, WEB_SEARCH];
+async function runJuno(u, messages, mode, device) {
+  const tools = device ? [...TOOLS, ...DEVICE_TOOLS, WEB_SEARCH] : [...TOOLS, WEB_SEARCH];
   let pendingDoc = null, guard = 0;
-  while (guard++ < 8) {
-    const d = await claude({ model: MODEL, max_tokens: 4000, system: SYSTEM(u, mode), tools, messages });
+  while (guard++ < 10) {
+    const d = await claude({ model: MODEL, max_tokens: 4000, system: SYSTEM(u, mode, device), tools, messages });
     const toolUses = (d.content || []).filter(c => c.type === 'tool_use');
     if (toolUses.length) {
       messages.push({ role: 'assistant', content: d.content });
-      const results = [];
+      const results = []; const clientActions = [];
       for (const tu of toolUses) {
         if (tu.name === 'make_pdf') { pendingDoc = { filename: (tu.input.filename || 'document.pdf'), html: tu.input.html || '' }; results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'PDF generated and shown to the user with a Download button.' }); continue; }
+        if (CLIENT_TOOLS.has(tu.name)) { clientActions.push({ id: tu.id, name: tu.name, input: tu.input || {} }); continue; }
         let out; try { out = await runTool(u, tu.name, tu.input || {}); } catch (e) { out = 'Error: ' + e.message; }
         results.push({ type: 'tool_result', tool_use_id: tu.id, content: out });
       }
+      if (clientActions.length) { return { clientActions, serverResults: results, messages, document: pendingDoc }; } // hand Mac actions to the desktop app
       messages.push({ role: 'user', content: results });
       continue;
     }
@@ -312,6 +325,18 @@ async function runJuno(u, messages, mode) {
   }
   return { text: 'Done.', document: pendingDoc };
 }
+function chatResult(u, out) {
+  if (out.clientActions) return { clientActions: out.clientActions, serverResults: out.serverResults, messages: out.messages, document: out.document };
+  return { text: out.text, document: out.document, user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] };
+}
+// Resume a conversation after the desktop app executed Mac actions and returned their results.
+app.post('/api/chat/resume', auth, async (req, res) => {
+  if (!CLAUDE_KEY) return res.status(500).json({ error: 'Brain not configured.' });
+  const u = req.user; const messages = req.body.messages || []; const results = req.body.results || [];
+  messages.push({ role: 'user', content: results });
+  try { res.json(chatResult(u, await runJuno(u, messages, req.body.mode || '', true))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ---------- autonomous agents (run on a schedule, 24/7, server-side) ----------
 const AGENT_FREQ = { q15: 15 * 60e3, hourly: 60 * 60e3, q6h: 6 * 3600e3, daily: 24 * 3600e3 };
@@ -360,8 +385,7 @@ app.post('/api/chat', auth, async (req, res) => {
     last.content = blocks;
   }
   try {
-    const { text, document } = await runJuno(u, messages, mode);
-    res.json({ text, document, user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] });
+    res.json(chatResult(u, await runJuno(u, messages, mode, !!req.body.device)));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
