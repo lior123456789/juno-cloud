@@ -175,6 +175,7 @@ const TOOLS = [
   { name: 'slack_message', description: 'Post a message to the user Slack workspace.', input_schema: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['text'] } },
   { name: 'notion_add', description: 'Add a page/task to the user Notion.', input_schema: { type: 'object', properties: { title: { type: 'string' }, content: { type: 'string' } }, required: ['title'] } },
   { name: 'remember', description: "Save a durable fact about the user (a preference, detail, goal, or ongoing context) so you can recall it in future chats. Use whenever the user shares something worth remembering.", input_schema: { type: 'object', properties: { fact: { type: 'string' } }, required: ['fact'] } },
+  { name: 'make_pdf', description: "Generate a downloadable PDF document for the user — a resume, cover letter, report, letter, invoice, study sheet, etc. Use this whenever the user asks to make/create/generate a PDF or a formatted document. Provide clean, well-structured HTML for the document body with inline CSS styling (headings, sections, spacing). Do NOT include <html>/<head>/<body> tags — just the inner content.", input_schema: { type: 'object', properties: { filename: { type: 'string', description: 'e.g. Lior_Resume.pdf' }, html: { type: 'string', description: 'the document body as styled HTML' } }, required: ['filename', 'html'] } },
 ];
 const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 5 };
 const MODES = {
@@ -245,21 +246,26 @@ app.post('/api/chat', auth, async (req, res) => {
     last.content = blocks;
   }
   const tools = [...TOOLS, WEB_SEARCH];
+  let pendingDoc = null;
   try {
     let guard = 0;
     while (guard++ < 8) {
-      const d = await claude({ model: MODEL, max_tokens: 2600, system: SYSTEM(u, mode), tools, messages });
+      const d = await claude({ model: MODEL, max_tokens: 4000, system: SYSTEM(u, mode), tools, messages });
       const toolUses = (d.content || []).filter(c => c.type === 'tool_use'); // client-side tools
       if (toolUses.length) {
         messages.push({ role: 'assistant', content: d.content });
         const results = [];
-        for (const tu of toolUses) { let out; try { out = await runTool(u, tu.name, tu.input || {}); } catch (e) { out = 'Error: ' + e.message; } results.push({ type: 'tool_result', tool_use_id: tu.id, content: out }); }
+        for (const tu of toolUses) {
+          if (tu.name === 'make_pdf') { pendingDoc = { filename: (tu.input.filename || 'document.pdf'), html: tu.input.html || '' }; results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'PDF generated and shown to the user with a Download button.' }); continue; }
+          let out; try { out = await runTool(u, tu.name, tu.input || {}); } catch (e) { out = 'Error: ' + e.message; }
+          results.push({ type: 'tool_result', tool_use_id: tu.id, content: out });
+        }
         messages.push({ role: 'user', content: results });
         continue;
       }
       if (d.stop_reason === 'pause_turn') { messages.push({ role: 'assistant', content: d.content }); continue; } // web search continuation
       const text = (d.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-      return res.json({ text: text || 'Done.', user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] });
+      return res.json({ text: text || 'Done.', document: pendingDoc, user: publicUser(u), tasks: u.tasks, events: u.events, activity: u.activity.slice(0, 50), memories: u.memories || [] });
     }
     res.json({ text: 'Done.', tasks: u.tasks, events: u.events });
   } catch (e) { res.status(500).json({ error: e.message }); }
